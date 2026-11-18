@@ -1,0 +1,2 @@
+move.ogg = bong_001, ok.ogg = question_002, back.ogg = minimize_008, no.ogg = error_006: Kenney Interface Sounds, CC0 (see KENNEY-LICENSE.txt).
+fire.ogg: "Wood-Burning on Fireplace Sound Effect loop" by PagDev, OpenGameArt, CC0. Trimmed into a seamless loop.

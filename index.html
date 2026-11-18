@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Omashu Console</title>
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden;cursor:none;user-select:none}
+/* The scene is 320×180 pixels, scaled by a whole number (6× on a 1080p TV). Menus sit on a finer grid (4× there). */
+#stage{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);overflow:hidden;background:#000}
+#stage canvas{position:absolute;inset:0;width:100%;height:100%;image-rendering:pixelated;image-rendering:crisp-edges}
+#ui{width:auto;height:auto;inset:auto;left:0;top:0}
+#shot{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0}
+#stage.pause #shot{opacity:1}
+.logo{position:absolute;display:flex;align-items:center;justify-content:center;opacity:.55;transition:opacity 180ms ease-out}
+.logo img{display:block;max-width:100%;max-height:100%}
+.logo.on{opacity:1}
+.logo.locked{opacity:.22;filter:grayscale(1)}
+.logo.locked.on{opacity:.4}
+.logo.nope{animation:nope 300ms steps(6)}
+@keyframes nope{20%,60%{translate:calc(var(--px) * -2) 0}40%,80%{translate:calc(var(--px) * 2) 0}}
+#stage.loading .logo:not(.chosen){opacity:0;transition:opacity 700ms cubic-bezier(.4,0,.6,1)}
+/* the game you picked breathes over the campfire (the fire keeps burning) until the game is drawing; then the whole window fades into the game */
+#stage.loading .logo.chosen{opacity:1;z-index:3;animation:pick 320ms ease-out,breathe 3.2s ease-in-out 2000ms infinite}
+@keyframes pick{50%{transform:scale(1.04)}}
+@keyframes breathe{0%,100%{opacity:1}50%{opacity:.55}}
+/* your pick grows and glides to the middle over 1.8 s while the woods dim a little behind it (the fire keeps burning) */
+.logo.glide{transition:translate 1800ms cubic-bezier(.45,0,.2,1),scale 1800ms cubic-bezier(.45,0,.2,1),opacity 180ms ease-out}
+/* over a game the logos are never shown, not even for a fade (sheet 08) */
+#stage.pause .logo,#stage.waking .logo,#stage.blackdark .logo{opacity:0;transition:none}
+#stage.off .logo{opacity:0;transition:opacity 900ms cubic-bezier(.4,0,.6,1)}
+.logo.slow{transition:opacity 900ms cubic-bezier(.4,0,.2,1)}
+#cover{position:absolute;inset:0;z-index:2;background:#000;opacity:1;pointer-events:none;transition:opacity 1200ms cubic-bezier(.4,0,.2,1)}
+#stage.lit #cover{opacity:0}
+#stage.dark #cover{opacity:1;transition:opacity 320ms ease-in}
+#stage.focus #cover{opacity:.35;transition:opacity 1500ms cubic-bezier(.4,0,.2,1)}
+#stage.off #cover{opacity:1;transition:opacity 1400ms cubic-bezier(.4,0,.6,1) 2200ms}
+#stage.blackout #cover{opacity:1;transition:opacity var(--fade,700ms) cubic-bezier(.4,0,.6,1)}
+#stage.blackdark #cover{opacity:1;transition:none}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<div id="stage">
+  <img id="shot" alt="">
+  <canvas id="scene" width="320" height="180"></canvas>
+  <div class="logo" data-k="zelda"><img src="logos/zelda.png" alt="The Legend of Zelda: Breath of the Wild"></div>
+  <div class="logo" data-k="wow"><img src="logos/wow.png" alt="World of Warcraft: Forever"></div>
+  <canvas id="ui" width="480" height="270"></canvas>
+  <div id="cover"></div>
+</div>
+
+<script src="demo.js"></script>
+<script src="forest.js"></script>
+<script src="fire.js"></script>
+<script src="soft.js"></script>
+<script>
+// Omashu Console. The approved campfire (mockups 02/03): Couch Mode's dark forest drawn once with no
+// pit, the shared live fire (fire.js) on top, Couch Mode's own letters, wood boxes, hand and arrow (forest.js).
+// A local helper says what to show via /state; the page sends /launch, /resume, /quit, /power.
+// On the web demo, demo.js plays the helper's part right here in the page.
+const { text, tw, frame, hand, Wd } = window.CM;
+const W = 320, H = 180;
+const px = (c, x, y, col) => { c.fillStyle = col; c.fillRect(x, y, 1, 1) };
+const ARROW = ["kkkkkkkkk", "kgggggggk", ".kgggggk.", "..kgggk..", "...kgk...", "....k...."], AC = { k: '#140904', g: '#ffd36b' };
+const arrow = (c, x, y) => ARROW.forEach((r, ry) => [...r].forEach((ch, rx) => { if (AC[ch]) px(c, x + rx, y + ry, AC[ch]) }));
+// The woods live at a calm pace (sheet 04, approved): 6 steps a second, each step held, like pixel-art idle scenes.
+// Drawn on another processor core (forest-worker.js, fast painter in soft.js) and handed back as pixels.
+// The fireflies and the fire are drawn here every frame, so they move smoothly. Now and then (every 3-6 minutes)
+// a pair of eyes opens in the mist between the far trunks, blinks once and is gone.
+const STEPS = 6, CALM = { liveFlies: true, glow: [.15, .3] };
+const BG = document.createElement('canvas'); BG.width = W; BG.height = H; const bgc = BG.getContext('2d'); let bgKey = '', asked = false;
+const perf = { frames: 0, forestMs: 0, forestN: 0, worst: 0, since: performance.now() };
+const took = ms => { perf.forestMs += ms; perf.forestN++; if (ms > perf.worst) perf.worst = ms };
+let worker = null; try { worker = new Worker('forest-worker.js'); worker.onerror = () => { worker = null; asked = false } } catch (e) { worker = null }
+if (worker) worker.onmessage = e => { asked = false; bgc.putImageData(new ImageData(new Uint8ClampedArray(e.data.buf), W, H), 0, 0); took(e.data.ms) };
+const soft = softCtx(W, H);
+function forest(step, eyes) { const key = step + JSON.stringify(eyes); if (key === bgKey) return;
+  const opts = Object.assign({ noPit: true, eyes }, CALM);
+  if (worker) { if (asked) return; asked = true; bgKey = key; worker.postMessage({ tick: step, opts }); return }
+  bgKey = key; const a = performance.now(); drawForest(soft, step, 0, opts); bgc.putImageData(soft.img, 0, 0); took(performance.now() - a) }   // no worker: draw here
+{ drawForest(soft, 7, 0, Object.assign({ noPit: true }, CALM)); bgc.putImageData(soft.img, 0, 0) }   // the first picture straight away
+// eyes in the dark: where (in the mist between the far trunks, below the signs, clear of the fire) and how rarely
+const DENS = [{ x: 62, y: 104 }, { x: 96, y: 112 }, { x: 226, y: 106 }, { x: 258, y: 100 }];
+const EYE_GAP = /[?&]eyes=fast/.test(location.search) ? [12, 20] : [180, 360];   // seconds between looks (fast: for tests)
+const eyesAt = (() => { let next = EYE_GAP[0] + Math.random() * (EYE_GAP[1] - EYE_GAP[0]), lastDen = -1, show = null;
+  return t => {
+    if (!show && t >= next) { let d; do { d = Math.floor(Math.random() * DENS.length) } while (d === lastDen); lastDen = d; show = { den: d, at: t } }
+    if (!show) return [];
+    const age = t - show.at; let open = 0;   // the look: slit, open, blink once, open, slit, gone
+    if (age < .2) open = .5; else if (age < 1.4) open = 1; else if (age < 1.6) open = 0; else if (age < 2.8) open = 1; else if (age < 3.0) open = .5;
+    else { show = null; next = t + EYE_GAP[0] + Math.random() * (EYE_GAP[1] - EYE_GAP[0]); return [] }
+    return [{ x: DENS[show.den].x, y: DENS[show.den].y, open }] } })();
+const FIRE = makeFire({ cx: 160, cy: 152, w: W, h: H });
+
+// ===== state =====
+const stage = document.getElementById('stage'), sc = document.getElementById('scene').getContext('2d'), uiC = document.getElementById('ui'), ui = uiC.getContext('2d');
+sc.imageSmoothingEnabled = false;
+const shot = document.getElementById('shot'), logos = [...document.querySelectorAll('.logo')];
+// spots on the 320×180 grid: two games, then the fire
+const SPOT = [{ x: 28, y: 34, w: 92, h: 60 }, { x: 200, y: 34, w: 92, h: 60 }, { x: 146, y: 124, w: 28, h: 30 }];
+let ver = null, run = null, pick = 0, dlg = null, dlgI = 0, pauseI = 0, busy = true, shown = -1, menuSeen = -1, games = { zelda: true, wow: false }, mode = 'show', loadTimer = 0;
+let lastWho = 'p1', savedAt = '', savedMs = 0, gameKey = null, leaveAfter = null;
+const FRESH_SAVE_MS = 15 * 60 * 1000;   // saved this recently: leaving needs no warning (15 minutes)
+// motion (sheet 08): when the current box opened, a closing box, a switch between two boxes, the pause/close counters
+let openAt = 0, closing = null, swFrom = null, swAt = 0, pauseSeen = -1, closeSeen = -1, darkMode = false, wakeAt = -1e9;
+let level = 0, target = 0;          // the fire: 0 out (embers) .. 1 full. It eases towards target.
+// the Xbox button menu (sheet 05): safest first, the big one last
+const PAUSE = ['Back', 'Main menu', 'Buttons', 'Turn off'], CAMP = ['Back', 'Buttons', 'Turn off'];
+let k = 1, u = 1, UW = 480, UH = 270;
+// k counts real screen pixels (Windows' 125% scaling would otherwise make a 1080p TV look 1536 wide and leave a border).
+function fit() { const d = devicePixelRatio || 1; k = Math.max(1, Math.floor(Math.min(innerWidth * d / 320, innerHeight * d / 180))); const c = k / d;
+  stage.style.width = 320 * c + 'px'; stage.style.height = 180 * c + 'px'; stage.style.setProperty('--px', c + 'px');
+  const nu = Math.max(1, Math.floor(k * 2 / 3)); if (nu !== u || uiC.width !== Math.ceil(320 * k / nu)) { u = nu; UW = Math.ceil(320 * k / u); UH = Math.ceil(180 * k / u); uiC.width = UW; uiC.height = UH; uiC.style.width = UW * u / d + 'px'; uiC.style.height = UH * u / d + 'px' }
+  logos.forEach((el, i) => { const s = SPOT[i]; Object.assign(el.style, { left: s.x * c + 'px', top: (s.y - (i === pick && !dlg ? 2 : 0)) * c + 'px', width: s.w * c + 'px', height: s.h * c + 'px' }) }) }
+addEventListener('resize', fit);
+
+// ===== sounds: real recordings (Kenney CC0, PagDev campfire CC0), at the levels picked on sheet 09 =====
+const GAIN = { move: 0.204, ok: 0.158, back: 0.193, no: 0.355 }, FIREVOL = .9;
+const ac = new (window.AudioContext || window.webkitAudioContext)(), BUF = {};
+const fireGain = ac.createGain(); fireGain.gain.value = 0; fireGain.connect(ac.destination);
+['move', 'ok', 'back', 'no', 'fire'].forEach(n => fetch('sounds/' + n + '.ogg').then(r => r.arrayBuffer()).then(b => ac.decodeAudioData(b)).then(d => { BUF[n] = d;
+  if (n === 'fire') { const f = ac.createBufferSource(); f.buffer = d; f.loop = true; f.connect(fireGain); f.start() } }).catch(() => {}));
+const played = [];
+const play = n => { played.push(n); if (played.length > 20) played.shift(); const b = BUF[n]; if (!b) return; if (ac.state === 'suspended') ac.resume(); const s = ac.createBufferSource(), v = ac.createGain(); v.gain.value = GAIN[n]; s.buffer = b; s.connect(v).connect(ac.destination); s.start() };
+let inGame = false, status = { tilt: '', battery: null };
+const fire = (on, secs = .32) => { if (on && inGame) on = false; if (ac.state === 'suspended') ac.resume(); fireGain.gain.cancelScheduledValues(ac.currentTime); fireGain.gain.setTargetAtTime(on ? FIREVOL : 0, ac.currentTime, secs / 3) };
+
+// ===== menus, in Couch Mode's wood box =====
+function list(c, t, items, sel, w) { const bob = (t >> 3) % 2, h = 26 + items.length * 22, x = Math.round((UW - w) / 2), y = Math.round((UH - h) / 2), r = frame(c, x, y, w, h);
+  items.forEach((s, i) => { const ty = r.y + 11 + i * 22; text(c, s, r.x + 30, ty, i === sel ? Wd.sel : Wd.dim, Wd.out); if (i === sel) hand(c, r.x + 10 - bob, ty) }); return r }
+function choice(c, t, lines, opts, sel, w) {   // a question with two answers side by side (the first is picked by default)
+  const bob = (t >> 3) % 2, h = 38 + lines.length * 15, x = Math.round((UW - w) / 2), y = Math.round((UH - h) / 2), r = frame(c, x, y, w, h);
+  lines.forEach((l, i) => text(c, l, r.x + Math.round((r.w - tw(l)) / 2), r.y + 9 + i * 15, Wd.txt, Wd.out));
+  const ys = r.y + 12 + lines.length * 15, gap = Math.round(r.w / 3), xs = [r.x + gap - 14, r.x + 2 * gap - 8];
+  opts.forEach((o, i) => text(c, o, xs[i], ys, i === sel ? Wd.sel : Wd.dim, Wd.out)); hand(c, xs[sel] - 18 - bob, ys) }
+// the tray under the menus: the phone (tilt) and the controller's battery, when known (from sheet 13)
+function trayBox(c, x, y, w, h) { c.fillStyle = '#120803'; c.fillRect(x + 2, y, w - 4, h); c.fillRect(x, y + 2, w, h - 4); c.fillRect(x + 1, y + 1, w - 2, h - 2);
+  c.fillStyle = '#71401f'; c.fillRect(x + 2, y + 1, w - 4, h - 2); c.fillRect(x + 1, y + 2, w - 2, h - 4); c.fillStyle = '#3a2212'; c.fillRect(x + 3, y + 3, w - 6, h - 6); c.fillStyle = '#24140a'; c.fillRect(x + 4, y + 4, w - 8, h - 8) }
+const PHONE = ['.kkkkkkk.', 'kwwkkkwwk', 'kwwwwwwwk', 'kwhhhsswk', 'kwhsssswk', 'kwssssswk', 'kwssssswk', 'kwssssswk', 'kwssssswk', 'kwssssswk', 'kwwwwwwwk', 'kwwwkwwwk', 'kwwwwwwwk', '.kkkkkkk.'];
+function phone(c, x, y, lit) { const P = lit ? { k: '#120803', w: '#71401f', s: '#ffd36b', h: '#fff1d6' } : { k: '#120803', w: '#4a2711', s: '#24140a', h: '#3a2212' }; PHONE.forEach((r, ry) => [...r].forEach((ch, rx) => { if (P[ch]) px(c, x + rx, y + ry, P[ch]) })) }
+function trayUnder(c, box) { if (!status.tilt) return; const w = 36, h = 24, x = Math.round(box.x + box.w / 2 - w / 2), y = box.y + box.h + 3; trayBox(c, x, y, w, h); phone(c, x + 14, y + 5, status.tilt === 'live') }
+
+// ===== the Buttons screen (sheet 05): Zelda's layout in Couch Mode's wood box =====
+// ----- the button glyphs, pixel drawn on the menu grid, about 22 x 13 -----
+const WOOD = { o: '#120803', a: '#9a5a2c', b: '#71401f', c: '#4a2711', t: '#efdcb4' };
+function box(c, x, y, w, h, fill, edge) { c.fillStyle = edge; c.fillRect(x + 1, y, w - 2, h); c.fillRect(x, y + 1, w, h - 2); c.fillStyle = fill; c.fillRect(x + 1, y + 1, w - 2, h - 2) }
+function tiny(c, s, cx, y, col) { text(c, s, Math.round(cx - tw(s) / 2), y, col, WOOD.o) }
+// a 3x5 pixel font for the letters printed on the buttons themselves
+const MINI = { A: ['.#.', '#.#', '###', '#.#', '#.#'], B: ['##.', '#.#', '##.', '#.#', '##.'], X: ['#.#', '#.#', '.#.', '#.#', '#.#'], Y: ['#.#', '#.#', '.#.', '.#.', '.#.'],
+  L: ['#..', '#..', '#..', '#..', '###'], R: ['##.', '#.#', '##.', '#.#', '#.#'], T: ['###', '.#.', '.#.', '.#.', '.#.'] };
+function mini(c, s, cx, y, col) { const w = s.length * 4 - 1, x0 = Math.round(cx - w / 2);
+  [...s].forEach((ch, i) => (MINI[ch] || []).forEach((r, ry) => [...r].forEach((p, rx) => { if (p === '#') px(c, x0 + i * 4 + rx, y + ry, col) }))) }
+function trigger(c, x, y, s) {   // tall, rounded top
+  c.fillStyle = WOOD.o; c.fillRect(x + 3, y - 1, 16, 1); c.fillRect(x + 1, y, 20, 2); c.fillRect(x, y + 2, 22, 13);
+  c.fillStyle = WOOD.a; c.fillRect(x + 3, y, 16, 1); c.fillRect(x + 2, y + 1, 18, 1); c.fillRect(x + 1, y + 2, 20, 11); c.fillStyle = WOOD.c; c.fillRect(x + 1, y + 12, 20, 2);
+  mini(c, s, x + 11, y + 5, WOOD.t) }
+function bumper(c, x, y, s) {    // flat, wide
+  box(c, x - 2, y + 3, 26, 11, WOOD.b, WOOD.o); c.fillStyle = WOOD.c; c.fillRect(x - 1, y + 11, 24, 2); mini(c, s, x + 11, y + 5, WOOD.t) }
+const FACE = { A: ['#2f8a3c', '#64c46a'], B: ['#9a2a24', '#e0574d'], X: ['#24508f', '#5b93df'], Y: ['#9a7a12', '#f0c93a'] };
+function face(c, x, y, s) { const [d, l] = FACE[s], cx = x + 11, cy = y + 7;
+  for (let yy = -7; yy <= 7; yy++) { const w = Math.round(Math.sqrt(49 - yy * yy)); c.fillStyle = WOOD.o; c.fillRect(cx - w - 1, cy + yy, w * 2 + 3, 1) }
+  for (let yy = -6; yy <= 6; yy++) { const w = Math.round(Math.sqrt(36 - yy * yy)); c.fillStyle = yy < -2 ? l : d; c.fillRect(cx - w, cy + yy, w * 2 + 1, 1) }
+  mini(c, s, cx, cy - 2, '#ffffff') }
+function stickIn(c, x, y, s) { const cx = x + 11, cy = y + 8;
+  for (let yy = -6; yy <= 6; yy++) { const w = Math.round(Math.sqrt(36 - yy * yy)); c.fillStyle = WOOD.o; c.fillRect(cx - w - 1, cy + yy, w * 2 + 3, 1) }
+  for (let yy = -5; yy <= 5; yy++) { const w = Math.round(Math.sqrt(25 - yy * yy)); c.fillStyle = Math.abs(yy) > 3 ? WOOD.c : WOOD.b; c.fillRect(cx - w, cy + yy, w * 2 + 1, 1) }
+  mini(c, s, cx, cy - 2, WOOD.t);
+  c.fillStyle = WOOD.t; c.fillRect(cx - 2, y - 4, 5, 1); c.fillRect(cx - 1, y - 3, 3, 1); px(c, cx, y - 2, WOOD.t) }   // press-in arrow
+function dpad(c, x, y) { const cx = x + 11, cy = y + 7;
+  c.fillStyle = WOOD.o; c.fillRect(cx - 3, cy - 8, 7, 17); c.fillRect(cx - 8, cy - 3, 17, 7);
+  c.fillStyle = WOOD.b; c.fillRect(cx - 2, cy - 7, 5, 15); c.fillRect(cx - 7, cy - 2, 15, 5);
+  c.fillStyle = WOOD.t; px(c, cx, cy - 6, WOOD.t); px(c, cx, cy + 6, WOOD.t); px(c, cx - 6, cy, WOOD.t); px(c, cx + 6, cy, WOOD.t) }
+function small(c, x, y, kind) {   // Start (three lines) / Back (two squares), the Xbox look
+  const cx = x + 11, cy = y + 7;
+  for (let yy = -5; yy <= 5; yy++) { const w = Math.round(Math.sqrt(30 - yy * yy)); c.fillStyle = WOOD.o; c.fillRect(cx - w - 1, cy + yy, w * 2 + 3, 1) }
+  for (let yy = -4; yy <= 4; yy++) { const w = Math.round(Math.sqrt(20 - yy * yy)); c.fillStyle = WOOD.c; c.fillRect(cx - w, cy + yy, w * 2 + 1, 1) }
+  c.fillStyle = WOOD.t;
+  if (kind === 'start') { c.fillRect(cx - 2, cy - 2, 5, 1); c.fillRect(cx - 2, cy, 5, 1); c.fillRect(cx - 2, cy + 2, 5, 1) }
+  else { c.fillRect(cx - 3, cy - 2, 3, 3); c.fillStyle = WOOD.c; c.fillRect(cx - 2, cy - 1, 1, 1); c.fillStyle = WOOD.t; c.fillRect(cx, cy, 3, 3) } }
+function xbox(c, x, y) { const cx = x + 11, cy = y + 7;
+  for (let yy = -7; yy <= 7; yy++) { const w = Math.round(Math.sqrt(49 - yy * yy)); c.fillStyle = WOOD.o; c.fillRect(cx - w - 1, cy + yy, w * 2 + 3, 1) }
+  for (let yy = -6; yy <= 6; yy++) { const w = Math.round(Math.sqrt(36 - yy * yy)); c.fillStyle = '#d8d8d0'; c.fillRect(cx - w, cy + yy, w * 2 + 1, 1) }
+  c.fillStyle = '#2a2a28'; for (let k = -3; k <= 3; k++) { px(c, cx + k, cy + k, '#2a2a28'); px(c, cx + k, cy - k, '#2a2a28') } }
+const ROWS = [
+  [[trigger, 'RT'], 'Attack', '', 'Y'], [[trigger, 'LT'], 'Shield', 'lock on', 'ZL'], [[bumper, 'RB'], 'Bow', 'aim', 'ZR'], [[bumper, 'LB'], 'Throw', '', 'R'],
+  [[face, 'A'], 'Talk', 'pick up', 'A'], [[face, 'Y'], 'Jump', 'glide', 'X'], [[face, 'X'], 'Powers', '', 'L'], [[face, 'B'], 'Sprint', 'cancel', 'B'],
+  [[stickIn, 'L'], 'Crouch', 'sneak', ''], [[stickIn, 'R'], 'Scope', '', ''], [[dpad], 'Quick pick', '', ''], [[small, 'start'], 'Inventory', '', '+'],
+  [[small, 'back'], 'Map', '', '-'], [[xbox], 'Couch menu', '', '']];
+function buttons(c) {
+  c.fillStyle = 'rgba(0,0,0,.5)'; c.fillRect(0, 0, UW, UH);
+  const w = 440, h = 218, x = Math.round((UW - w) / 2), y = Math.round((UH - h) / 2) - 2, r = frame(c, x, y, w, h);
+  const title = 'Buttons'; text(c, title, r.x + Math.round((r.w - tw(title)) / 2), r.y + 8, Wd.sel, Wd.out);
+  ROWS.forEach(([[g, a], word, extra], i) => {   // (the Wii U "Game shows" letters were dropped 2026-11-09: too confusing)
+    const col = i < 7 ? 0 : 1, row = i % 7, gx = r.x + 16 + col * 210, gy = r.y + 32 + row * 25;
+    g(c, gx, gy, a);
+    text(c, word, gx + 32, gy + 3, Wd.sel, Wd.out);
+    if (extra) text(c, extra, gx + 36 + tw(word), gy + 3, Wd.dim, Wd.out);
+  });
+}
+
+
+// ===== drawing: the fire live =====
+let t = 0, last = performance.now(), tk = 0;
+let gameUp = false;   // a game is on screen in front of us: draw nothing at all, so the game gets the whole machine
+function draw(now) {
+  if (darkMode) { last = now; setTimeout(() => requestAnimationFrame(draw), 500); return }   // dark: the page is black and still
+  if (gameUp && mode !== 'pause') { last = now; perf.frames++; setTimeout(() => requestAnimationFrame(draw), 250); return }
+  const dt = Math.min(.05, (now - last) / 1000); last = now; t += dt; tk = Math.floor(t * 16);
+  // catching takes about 3 s, dying down about 2.5 s (the remote's pace)
+  const sp = target > level ? .33 : .4; level += Math.sign(target - level) * Math.min(Math.abs(target - level), sp * dt);
+  if (mode === 'pause') sc.clearRect(0, 0, W, H);
+  else { forest(Math.floor(t * STEPS), eyesAt(t)); sc.drawImage(BG, 0, 0); drawFireflies(sc, t, 16); if (level < .5) { sc.fillStyle = `rgba(0,2,8,${(.45 * (1 - level * 2)).toFixed(2)})`; sc.fillRect(0, 0, W, H) } FIRE.draw(sc, t, dt, level, null) }
+  ui.clearRect(0, 0, UW, UH);
+  // the box on screen: opens (dark fades in 0.18 s, the box rises into place), closes backwards (0.14 s), and
+  // switches between boxes (the old one fades in 0.1 s, the new one rises in 0.2 s)
+  const cur = boxName(), shown = closing ? closing.name : cur;
+  let a = 1, dy = 0, dim = 0;
+  if (closing) { const p = Math.min(1, (now - closing.at) / 140), e = p * p * p; a = 1 - e; dy = 3 * e; dim = closing.keepDim ? .45 : .45 * (1 - p);   // leaving a game: the dim stays and the fade to black takes over (it brightened for a frame: film 2026-11-09)
+    if (p >= 1 && !closing.done) { closing.done = true; setTimeout(closing.then, 0) } }
+  else if (cur) { const p = Math.max(0, Math.min(1, (now - openAt) / 180)), e = 1 - Math.pow(1 - p, 3), q = Math.max(0, Math.min(1, (now - openAt) / 160)); a = 1 - Math.pow(1 - q, 3); dy = 4 * (1 - e); dim = .45 * e }
+  if (dim > 0) { ui.fillStyle = `rgba(0,0,0,${dim.toFixed(3)})`; ui.fillRect(0, 0, UW, UH) }
+  if (shown && a > 0) {
+    const sw = now - swAt;
+    ui.save(); ui.translate(0, Math.round(dy));
+    if (!closing && swFrom !== null && sw < 200) {
+      if (sw < 100 && swFrom) { ui.globalAlpha = a * (1 - sw / 100); drawBox(swFrom) }
+      const e = 1 - Math.pow(1 - sw / 200, 3); ui.globalAlpha = a * e; ui.translate(0, Math.round(5 * (1 - e))); drawBox(shown)
+    } else { ui.globalAlpha = a; drawBox(shown) }
+    ui.restore()
+  } else if (!shown && !busy && mode === 'show') { const s = SPOT[pick]; arrow(sc, s.x + Math.floor(s.w / 2) - 4, s.y - 11 + ((tk >> 3) % 2)) }
+  perf.frames++;
+  requestAnimationFrame(draw);
+}
+
+// "It's been 23 minutes since Zelda saved" (under an hour), else the clock time, else never saved
+function saveLine() { if (!savedMs && !savedAt) return "Zelda hasn't been saved yet";
+  const m = savedMs ? Math.floor((Date.now() - savedMs) / 60000) : -1;
+  if (m >= 0 && m < 60) return "It's been " + m + ' minutes since Zelda saved';
+  return "Zelda hasn't saved since " + savedAt }
+const boxName = () => dlg || (mode === 'pause' ? 'pause' : null);
+function drawBox(n) {
+  if (n === 'buttons') buttons(ui);
+  else if (n === 'pause') trayUnder(ui, list(ui, tk, PAUSE, pauseI, 150));
+  else if (n === 'camp') trayUnder(ui, list(ui, tk, CAMP, dlgI, 150));
+  else if (n === 'who') choice(ui, tk, ["Who's playing?"], ['Player 1', 'Player 2'], dlgI, 164);
+  else if (n === 'fire') choice(ui, tk, ['Turn off?'], ['Back', 'Yes'], dlgI, 164);
+  else if (n === 'leave') choice(ui, tk, [saveLine(), leaveAfter === 'menu' ? 'Go to the main menu anyway?' : 'Turn off anyway?'], ['Back', 'Yes'], dlgI, 236) }
+function openBox(to) { dlg = to; openAt = performance.now(); closing = null; swFrom = null }
+function swap(to) { swFrom = boxName(); swAt = performance.now(); dlg = to }
+function closeBox(then, keepDim) { if (closing) return; closing = { name: boxName(), at: performance.now(), then, done: false, keepDim } }
+const shut = () => { dlg = null; closing = null; render() };
+// leave a game: the box closes, the picture fades to black, then the helper closes the game (sheet 08)
+function leaveGame(after) { const ms = after === 'fire' ? 900 : 700; stage.style.setProperty('--fade', ms + 'ms'); stage.classList.add('blackout'); fire(false);
+  setTimeout(() => call(after === 'fire' ? '/power' : '/quit'), ms + 20) }
+function render() { logos.forEach((el, i) => { el.classList.toggle('on', i === pick && !dlg); el.classList.toggle('locked', !games[el.dataset.k]) }); fit() }
+const call = p => fetch(p, { method: 'POST' }).catch(() => ({ ok: false }));
+function lightUp() { clearTimeout(loadTimer); busy = true; const d = performance.now() - wakeAt < 3000 ? 1200 : 0;
+  setTimeout(() => { stage.classList.add('waking'); stage.classList.remove('dark', 'off', 'loading', 'blackout', 'blackdark', 'focus'); stage.classList.add('lit');
+    logos.forEach(e => { e.classList.remove('chosen', 'glide'); e.style.translate = e.style.scale = '' }); busy = false; target = 1; render(); fire(true);
+    setTimeout(() => { logos.forEach(e => e.classList.add('slow')); stage.classList.remove('waking'); setTimeout(() => logos.forEach(e => e.classList.remove('slow')), 1000) }, 1400) }, d) }
+function darken() { stage.classList.remove('lit'); stage.classList.add('dark'); busy = true; fire(false) }
+function shake(el) { el.classList.remove('nope'); void el.offsetWidth; el.classList.add('nope') }
+
+function move(dx, dy) {
+  if (closing || dlg === 'buttons') return;
+  if (dlg) { const horiz = dlg !== 'camp'; const d = horiz ? dx : dy, top = dlg === 'camp' ? CAMP.length - 1 : 1; if (d) { const n = Math.max(0, Math.min(top, dlgI + d)); if (n !== dlgI) { dlgI = n; play('move') } } return }
+  if (mode === 'pause') { if (dy) { const n = Math.max(0, Math.min(PAUSE.length - 1, pauseI + dy)); if (n !== pauseI) { pauseI = n; play('move') } } return }
+  if (busy) return;
+  const old = pick; if (dy > 0) pick = 2; else if (dy < 0 && pick === 2) pick = 0; else if (dx && pick < 2) pick = 1 - pick;
+  if (pick !== old) { play('move'); render() } }
+// the picked logo slowly grows and glides to the middle, resting just above the fire
+function glide(el) { const s = stage.getBoundingClientRect(), r = el.getBoundingClientRect();
+  el.classList.add('glide'); el.style.translate = `${Math.round(s.left + s.width / 2 - (r.left + r.width / 2))}px ${Math.round(s.top + s.height * .34 - (r.top + r.height / 2))}px`; el.style.scale = '1.4' }
+function launch(key, who) {
+  const el = logos[key === 'zelda' ? 0 : 1];
+  play('ok'); busy = true; el.classList.add('chosen');
+  loadTimer = setTimeout(() => { stage.classList.add('loading', 'focus'); glide(el) }, 200);
+  call('/launch?game=' + key + (who ? '&who=' + who : '')).then(r => { if (r.ok) return; lightUp(); play('no'); shake(el) }) }
+function press() {
+  if (closing) return;
+  if (dlg === 'who') { const who = dlgI === 0 ? 'p1' : 'p2'; closeBox(() => { shut(); launch('zelda', who) }); return }
+  if (dlg === 'buttons') return;
+  if (dlg === 'camp') { if (dlgI === 1) { play('ok'); swap('buttons'); return } const yes = dlgI === 2; play(yes ? 'ok' : 'back'); closeBox(() => { shut(); if (yes) putOut() }); return }
+  if (dlg === 'fire') { const yes = dlgI === 1; play(yes ? 'ok' : 'back'); closeBox(() => { shut(); if (yes) putOut() }); return }
+  if (dlg === 'leave') { const yes = dlgI === 1; play(yes ? 'ok' : 'back'); if (!yes) { swap(null); return } closeBox(() => leaveGame(leaveAfter), true); return }
+  if (mode === 'pause') { play('ok');
+    if (pauseI === 0) { closeBox(() => call('/resume')); return }
+    if (pauseI === 2) { swap('buttons'); return }
+    const after = pauseI === 3 ? 'fire' : 'menu';
+    const fresh = savedMs > 0 && Date.now() - savedMs < FRESH_SAVE_MS;
+    if (gameKey === 'zelda' && !fresh) { leaveAfter = after; swap('leave'); dlgI = 0; return }          // Zelda doesn't save on exit: ask, unless it just saved
+    closeBox(() => leaveGame(after), true); return }
+  if (busy) return;
+  if (pick === 2) { play('ok'); openBox('fire'); dlgI = 0; render(); return }
+  const el = logos[pick], key = el.dataset.k;
+  if (!games[key]) { play('no'); shake(el); return }
+  if (key === 'zelda') { play('ok'); openBox('who'); dlgI = lastWho === 'p2' ? 1 : 0; render(); return }
+  launch(key, null) }
+// put the fire out at the campfire: the fire dies down and the logos fade, the woods fade to black, then the TV goes dark
+function putOut() { busy = true; target = 0; fire(false, 2); stage.classList.add('off'); setTimeout(() => call('/power'), 3800) }
+function back() { if (closing) return;
+  if (dlg === 'buttons') { play('back'); swap(mode === 'pause' ? null : 'camp'); return }   // B: back to the menu it came from
+  if (dlg === 'leave') { play('back'); swap(null); return }
+  if (dlg) { play('back'); closeBox(shut); return }
+  if (mode === 'pause') { play('back'); pauseI = 0; closeBox(() => call('/resume')) } }
+
+// keyboard only for testing at a desk: arrows, Enter, Backspace (no Escape: nothing may step the campfire aside)
+addEventListener('keydown', e => { const d = { ArrowUp: [0, -1], ArrowDown: [0, 1], ArrowLeft: [-1, 0], ArrowRight: [1, 0] }[e.key];
+  if (d) { move(...d); e.preventDefault() } if (e.key === 'Enter') press(); if (e.key === 'Backspace') back() });
+addEventListener('blur', () => fire(false));
+addEventListener('focus', () => { if (mode === 'show' && !busy) fire(true) });
+let prev = [], held = 0, flick = false;
+(function pad(ts) { const g = [...(navigator.getGamepads?.() || [])].find(Boolean);
+  if (g) { const x = g.axes[0] || 0, y = g.axes[1] || 0, b = g.buttons.map(v => v.pressed);
+    // Stick: one move per flick, like a console menu (past 60% it moves once; back under 30% before the next).
+    const m = Math.max(Math.abs(x), Math.abs(y));
+    if (m > .6 && !flick) { flick = true; move(...(Math.abs(x) > Math.abs(y) ? [x > 0 ? 1 : -1, 0] : [0, y > 0 ? 1 : -1])) } else if (m < .3) flick = false;
+    [[13, 0, 1], [12, 0, -1], [15, 1, 0], [14, -1, 0]].forEach(([i, dx, dy]) => { if (b[i] && !prev[i]) move(dx, dy) });
+    if (b[0] && !prev[0]) press(); if (b[1] && !prev[1]) back();
+    // both sticks held in for 2 s at the campfire: Back / Put the fire out (the Xbox button does the same via the helper)
+    if (b[10] && b[11] && mode === 'show' && !busy && !dlg) { if (!held) held = ts; else if (ts - held >= 2000) { held = -1; openCamp() } }
+    else if (!(b[10] && b[11])) held = 0;
+    prev = b }
+  requestAnimationFrame(pad) })(0);
+function openCamp() { if (mode !== 'show' || busy || dlg || closing) return; play('ok'); openBox('camp'); dlgI = 0; render() }
+
+// ===== the helper says what to show (demo.js on the web) =====
+// mode: show | hide | pause.  n: up each time the fire should (re)light (start, game over, woken up).
+// menu: up each time the Xbox button was pressed at the campfire.  who: last player.  saved: Zelda's last save time.
+async function poll() {
+  try { const s = await (await fetch('/state', { cache: 'no-store' })).json();
+    if (ver === null) ver = s.v; else if (s.v && s.v !== ver) { location.reload(); return }
+    inGame = !!s.game; gameUp = !!s.up; gameKey = s.game || gameKey; if (inGame) fire(false);
+    if (gameUp && stage.classList.contains('focus')) { stage.classList.remove('focus', 'loading'); sc.clearRect(0, 0, W, H) }   // nothing of the campfire left on the layer behind the game (it flashed when the menu came up: film 2026-11-09)   // in the game now: no dim left behind (it greyed the menu and the fades)
+    if (s.who) lastWho = s.who; savedAt = s.saved || ''; savedMs = s.savedMs || 0;
+    status = { tilt: s.tilt || '', battery: typeof s.battery === 'number' ? s.battery : null };
+    if (s.games) { const before = JSON.stringify(games); games = s.games; if (JSON.stringify(games) !== before) render() }
+    // a restarted helper counts from 0 again (2026-11-11: after a watchdog restart the Xbox button's menu closed at once or never came)
+    if (s.run !== run) { if (run !== null) { closeSeen = s.close || 0; menuSeen = s.menu || 0; pauseSeen = -1 } run = s.run }
+    if (closeSeen < 0) closeSeen = s.close || 0;
+    // dark: black at once and still; waking is noted so the fire waits for the TV picture before it lights
+    if (s.dark && !darkMode) { darkMode = true; stage.classList.add('blackdark'); busy = true; dlg = null; closing = null; fire(false) }
+    else if (!s.dark && darkMode) { darkMode = false; wakeAt = performance.now() }
+    if (s.mode === 'pause') {
+      // the menu over a game: put the exact frame up first, then tell the helper, which brings this window over the game
+      if (mode !== 'pause' && s.pauseN !== pauseSeen) { sc.clearRect(0, 0, W, H); pauseSeen = s.pauseN; mode = 'pause'; pauseI = 0; dlg = null; closing = null; swFrom = null; openAt = performance.now() + 1e9; fire(false);
+        const p = s.pauseN; shot.onload = shot.onerror = () => { stage.classList.add('pause', 'lit'); stage.classList.remove('loading', 'dark', 'off', 'blackout'); openAt = performance.now() + 60; requestAnimationFrame(() => requestAnimationFrame(() => call('/ready?p=' + p))) };
+        shot.src = '/pause.png?' + Date.now() }
+      if ((s.close || 0) !== closeSeen) { closeSeen = s.close || 0; if (mode === 'pause' && !closing) { play('back'); closeBox(() => call('/resume')) } } }
+    else { if (mode === 'pause') { mode = 'show'; stage.classList.remove('pause'); dlg = null; closing = null }
+      if (s.mode === 'hide') { mode = 'hide'; if (!stage.classList.contains('dark')) darken() }
+      else { mode = 'show'; if (s.n !== shown) { shown = s.n; dlg = null; level = 0; lightUp() }
+        if (menuSeen < 0) menuSeen = s.menu || 0; else if ((s.menu || 0) !== menuSeen) { menuSeen = s.menu; openCamp() } } }
+  } catch (e) { }
+  setTimeout(poll, inGame ? 50 : 200) }
+const loaded = im => im.complete ? Promise.resolve() : new Promise(r => { im.onload = im.onerror = r });
+render(); requestAnimationFrame(draw);
+if (/[?&]perf=1/.test(location.search)) setInterval(() => { const sec = (performance.now() - perf.since) / 1000;
+  fetch('/note?m=' + encodeURIComponent(`page: ${(perf.frames / sec).toFixed(1)} fps, forest ${(perf.forestMs / Math.max(1, perf.forestN)).toFixed(2)} ms avg, ${perf.worst.toFixed(1)} ms worst`), { method: 'POST' }).catch(() => {});
+  perf.frames = 0; perf.forestMs = 0; perf.forestN = 0; perf.worst = 0; perf.since = performance.now() }, 10000);
+Promise.race([Promise.all([...document.images].filter(i => i.id !== 'shot').map(loaded)), new Promise(r => setTimeout(r, 1200))]).then(poll);
+</script>
+</body>
+</html>
